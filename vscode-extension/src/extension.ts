@@ -31,8 +31,7 @@ export function activate(context: vscode.ExtensionContext) {
       const port = config.get<number>("port", 7842);
       const host = config.get<string>("host", "127.0.0.1");
       const apiKey = config.get<string>("apiKey", "");
-
-      const wsRoot = "/Users/pikachu/Desktop/J/Create/Era";
+      const wsRoot = config.get<string>("workspaceRoot", "") || undefined;
       server = new BridgeServer(port, host, apiKey, outputChannel, chatLog, wsRoot);
 
       try {
@@ -104,7 +103,7 @@ export function activate(context: vscode.ExtensionContext) {
     const port = config.get<number>("port", 7842);
     const host = config.get<string>("host", "127.0.0.1");
     const apiKey = config.get<string>("apiKey", "");
-    const wsRoot = "/Users/pikachu/Desktop/J/Create/Era";
+    const wsRoot = config.get<string>("workspaceRoot", "") || undefined;
     server = new BridgeServer(port, host, apiKey, outputChannel, chatLog, wsRoot);
     server.start().then(() => {
       outputChannel.appendLine(`[${ts()}] Server auto-started on http://${host}:${port}`);

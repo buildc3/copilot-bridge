@@ -83,6 +83,11 @@
           "type": "string",
           "default": "You are a helpful AI assistant powered by GitHub Copilot. Answer questions clearly and concisely.",
           "description": "System prompt sent with every request"
+        },
+        "copilotBridge.workspaceRoot": {
+          "type": "string",
+          "default": "",
+          "description": "Workspace root path for the agent. Leave empty to use the currently open VS Code workspace folder."
         }
       }
     }
