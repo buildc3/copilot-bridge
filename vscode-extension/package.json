@@ -1,0 +1,101 @@
+{
+  "name": "copilot-bridge",
+  "displayName": "Copilot Bridge",
+  "description": "Expose VS Code Copilot as an HTTP API for external platforms (Telegram, Slack, etc.)",
+  "version": "1.0.0",
+  "publisher": "era",
+  "engines": {
+    "vscode": "^1.95.0"
+  },
+  "categories": ["Other"],
+  "activationEvents": ["*"],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "copilotBridgePanel",
+          "title": "Copilot Bridge",
+          "icon": "media/bridge-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "copilotBridgePanel": [
+        {
+          "type": "webview",
+          "id": "copilotBridge.chatView",
+          "name": "Bridge Chat"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "copilotBridge.start",
+        "title": "Copilot Bridge: Start Server"
+      },
+      {
+        "command": "copilotBridge.stop",
+        "title": "Copilot Bridge: Stop Server"
+      },
+      {
+        "command": "copilotBridge.status",
+        "title": "Copilot Bridge: Show Status"
+      },
+      {
+        "command": "copilotBridge.showChat",
+        "title": "Copilot Bridge: Show Chat Log"
+      },
+      {
+        "command": "copilotBridge.agent",
+        "title": "Copilot Bridge: Run Agent Task"
+      }
+    ],
+    "configuration": {
+      "title": "Copilot Bridge",
+      "properties": {
+        "copilotBridge.port": {
+          "type": "number",
+          "default": 7842,
+          "description": "Port for the Copilot Bridge HTTP server"
+        },
+        "copilotBridge.host": {
+          "type": "string",
+          "default": "127.0.0.1",
+          "description": "Host to bind the server to. Use 0.0.0.0 to allow external connections."
+        },
+        "copilotBridge.apiKey": {
+          "type": "string",
+          "default": "",
+          "description": "API key required for authenticating requests. Leave empty to disable auth (NOT recommended for exposed servers)."
+        },
+        "copilotBridge.maxTokens": {
+          "type": "number",
+          "default": 4096,
+          "description": "Maximum tokens for Copilot responses"
+        },
+        "copilotBridge.model": {
+          "type": "string",
+          "default": "copilot-gpt-4o",
+          "description": "Language model to use (must be available in your Copilot subscription)"
+        },
+        "copilotBridge.systemPrompt": {
+          "type": "string",
+          "default": "You are a helpful AI assistant powered by GitHub Copilot. Answer questions clearly and concisely.",
+          "description": "System prompt sent with every request"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "eslint src --ext ts"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.95.0",
+    "typescript": "^5.4.0"
+  }
+}

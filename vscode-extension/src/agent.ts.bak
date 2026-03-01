@@ -1,0 +1,781 @@
+/**
+ * Copilot Bridge — Agent Mode
+ *
+ * Turns Copilot into a coding agent that can:
+ *   - Create / edit / read files
+ *   - List directories
+ *   - Run terminal commands (with user approval)
+ *
+ * The agent sends the prompt to Copilot with a special system prompt
+ * that instructs it to output structured action blocks. These are
+ * parsed and executed in the VS Code workspace.
+ *
+ * Terminal commands pause execution and require explicit user approval
+ * (e.g. via Telegram inline buttons) before they run.
+ */
+
+import * as vscode from "vscode";
+import * as fs from "fs";
+import * as path from "path";
+import * as cp from "child_process";
+
+// ── Types ───────────────────────────────────────────────────────
+
+export interface AgentAction {
+  type: "create_file" | "edit_file" | "read_file" | "list_dir" | "run_command";
+  path?: string;
+  content?: string;
+  oldText?: string;
+  newText?: string;
+  command?: string;
+  output?: string;
+  status: "completed" | "pending_approval" | "denied" | "error";
+  error?: string;
+}
+
+export interface AgentTask {
+  id: string;
+  prompt: string;
+  status: "running" | "awaiting_approval" | "completed" | "error";
+  actions: AgentAction[];
+  pendingCommand?: string;
+  message: string;
+  /** Stored Copilot raw response text (for continuation after approval) */
+  rawResponse?: string;
+  /** Actions that come after the pending command (to execute after approval) */
+  remainingActions?: AgentAction[];
+  /** Remaining summary text */
+  remainingSummary?: string;
+}
+
+// ── Agent System Prompt ─────────────────────────────────────────
+
+const AGENT_SYSTEM_PROMPT = `You are a coding agent with DIRECT ACCESS to the user's filesystem. You run inside VS Code and can create files, edit files, and run commands FOR REAL.
+
+CRITICAL: You MUST use the action blocks below to perform actions. Do NOT just show code — ACTUALLY CREATE the files using the action blocks. The action blocks are parsed and executed automatically.
+
+=== ACTION BLOCK FORMATS (USE THESE — THEY ARE EXECUTED) ===
+
+CREATE/OVERWRITE A FILE:
+<<<CREATE_FILE>>>
+path: relative/path/to/file.ext
+<<<CONTENT>>>
+file content here
+<<<END_ACTION>>>
+
+READ A FILE:
+<<<READ_FILE>>>
+path: relative/path/to/file.ext
+<<<END_ACTION>>>
+
+LIST A DIRECTORY:
+<<<LIST_DIR>>>
+path: relative/path
+<<<END_ACTION>>>
+
+EDIT PART OF A FILE (find and replace):
+<<<EDIT_FILE>>>
+path: relative/path/to/file.ext
+<<<OLD>>>
+exact text to find
+<<<NEW>>>
+replacement text
+<<<END_ACTION>>>
+
+RUN A TERMINAL COMMAND (requires user approval):
+<<<RUN_COMMAND>>>
+command: the shell command to run
+<<<END_ACTION>>>
+
+=== MANDATORY RULES ===
+1. ALWAYS use <<<CREATE_FILE>>> blocks to create files. NEVER just show code in a markdown code block — that does nothing. The action blocks are what actually write to disk.
+2. Every programming request MUST result in at least one <<<CREATE_FILE>>> block.
+3. Use relative paths from the workspace root.
+4. Create files BEFORE running them.
+5. You can chain multiple action blocks in one response.
+6. After your action blocks, write a SHORT summary of what you did.
+7. For programming tasks, write complete, working, production-quality code.
+8. NEVER say "here's the code" without a <<<CREATE_FILE>>> block — that is WRONG.
+9. If the user says "create", "make", "write", "build" — you MUST use <<<CREATE_FILE>>>.
+10. Terminal commands REQUIRE user approval — use only when needed.
+
+EXAMPLE — if user says "create a hello world python program":
+<<<CREATE_FILE>>>
+path: hello.py
+<<<CONTENT>>>
+print("Hello, World!")
+<<<END_ACTION>>>
+
+I created hello.py with a simple Hello World program.`;
+
+// ── Agent Class ─────────────────────────────────────────────────
+
+export class Agent {
+  private tasks = new Map<string, AgentTask>();
+
+  constructor(
+    private workspaceRoot: string,
+    private log: vscode.OutputChannel,
+    private chatLog?: vscode.OutputChannel
+  ) {}
+
+  getTask(id: string): AgentTask | undefined {
+    return this.tasks.get(id);
+  }
+
+  /**
+   * Run an agent task. Returns immediately if approval is needed.
+   */
+  async run(prompt: string): Promise<AgentTask> {
+    const taskId = `task_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+    const task: AgentTask = {
+      id: taskId,
+      prompt,
+      status: "running",
+      actions: [],
+      message: "",
+    };
+    this.tasks.set(taskId, task);
+
+    try {
+      // Get Copilot response
+      const rawResponse = await this.askCopilot(prompt);
+      task.rawResponse = rawResponse;
+
+      // Parse actions from response
+      const { actions, summary } = this.parseResponse(rawResponse);
+
+      // Execute actions sequentially, stopping at terminal commands
+      for (let i = 0; i < actions.length; i++) {
+        const action = actions[i];
+
+        if (action.type === "run_command") {
+          // Stop here — need approval
+          action.status = "pending_approval";
+          task.actions.push(action);
+          task.pendingCommand = action.command;
+          task.status = "awaiting_approval";
+          task.remainingActions = actions.slice(i + 1);
+          task.remainingSummary = summary;
+
+          // Build message about what was done so far
+          const doneText = this.buildActionsSummary(
+            task.actions.filter((a) => a.status === "completed")
+          );
+          task.message = doneText
+            ? `${doneText}\n\n⚠️ I need to run a command:\n\`${action.command}\`\n\nApprove or deny?`
+            : `⚠️ I need to run a command:\n\`${action.command}\`\n\nApprove or deny?`;
+
+          this.logToChat(task);
+          return task;
+        }
+
+        // Execute safe actions immediately
+        await this.executeAction(action);
+        task.actions.push(action);
+      }
+
+      // All done — no approval needed
+      task.status = "completed";
+      task.message = summary || this.buildActionsSummary(task.actions);
+      this.logToChat(task);
+      return task;
+    } catch (err: any) {
+      task.status = "error";
+      task.message = `Error: ${err.message}`;
+      this.log.appendLine(`[agent] Error: ${err.message}`);
+      return task;
+    }
+  }
+
+  /**
+   * Approve or deny a pending terminal command, then continue.
+   */
+  async approveTask(taskId: string, approved: boolean): Promise<AgentTask | undefined> {
+    const task = this.tasks.get(taskId);
+    if (!task || task.status !== "awaiting_approval") return undefined;
+
+    // Find the pending action
+    const pendingAction = task.actions.find(
+      (a) => a.status === "pending_approval"
+    );
+    if (!pendingAction) return undefined;
+
+    if (approved) {
+      // Execute the command
+      try {
+        const output = await this.runShellCommand(pendingAction.command!);
+        pendingAction.output = output;
+        pendingAction.status = "completed";
+        this.log.appendLine(
+          `[agent] Command approved and executed: ${pendingAction.command}`
+        );
+      } catch (err: any) {
+        pendingAction.output = err.message;
+        pendingAction.status = "error";
+        pendingAction.error = err.message;
+      }
+    } else {
+      pendingAction.status = "denied";
+      pendingAction.output = "Denied by user";
+      this.log.appendLine(
+        `[agent] Command denied: ${pendingAction.command}`
+      );
+    }
+
+    task.pendingCommand = undefined;
+    task.status = "running";
+
+    // Continue with remaining actions
+    if (task.remainingActions) {
+      for (let i = 0; i < task.remainingActions.length; i++) {
+        const action = task.remainingActions[i];
+
+        if (action.type === "run_command") {
+          // Another command — need approval again
+          action.status = "pending_approval";
+          task.actions.push(action);
+          task.pendingCommand = action.command;
+          task.status = "awaiting_approval";
+          task.remainingActions = task.remainingActions.slice(i + 1);
+
+          const cmdMsg = `⚠️ I need to run another command:\n\`${action.command}\`\n\nApprove or deny?`;
+          task.message = cmdMsg;
+          this.logToChat(task);
+          return task;
+        }
+
+        await this.executeAction(action);
+        task.actions.push(action);
+      }
+    }
+
+    // If command was approved and ran, optionally ask Copilot for a follow-up summary
+    if (approved && pendingAction.status === "completed" && pendingAction.output) {
+      try {
+        const followUp = await this.askCopilot(
+          `I ran the command \`${pendingAction.command}\` and got this output:\n\`\`\`\n${pendingAction.output}\n\`\`\`\n\nBriefly summarize the result for the user. If there are errors, suggest fixes.`
+        );
+        // Parse follow-up for any additional actions
+        const { actions: followUpActions, summary: followUpSummary } =
+          this.parseResponse(followUp);
+
+        for (const action of followUpActions) {
+          if (action.type === "run_command") {
+            action.status = "pending_approval";
+            task.actions.push(action);
+            task.pendingCommand = action.command;
+            task.status = "awaiting_approval";
+            task.message = `${followUpSummary}\n\n⚠️ I need to run:\n\`${action.command}\`\n\nApprove or deny?`;
+            this.logToChat(task);
+            return task;
+          }
+          await this.executeAction(action);
+          task.actions.push(action);
+        }
+
+        task.message = followUpSummary || task.remainingSummary || this.buildActionsSummary(task.actions);
+      } catch {
+        task.message = task.remainingSummary || this.buildActionsSummary(task.actions);
+      }
+    } else {
+      task.message = task.remainingSummary || this.buildActionsSummary(task.actions);
+    }
+
+    task.status = "completed";
+    task.remainingActions = undefined;
+    this.logToChat(task);
+    return task;
+  }
+
+  // ── Copilot Communication ───────────────────────────────────
+
+  private async askCopilot(prompt: string): Promise<string> {
+    const config = vscode.workspace.getConfiguration("copilotBridge");
+    const modelId = config.get<string>("model", "copilot-gpt-4o");
+    const maxTokens = config.get<number>("maxTokens", 4096);
+
+    let models = await vscode.lm.selectChatModels({ family: modelId });
+    if (models.length === 0) {
+      models = await vscode.lm.selectChatModels();
+      if (models.length === 0) {
+        throw new Error(
+          "No language models available. Make sure GitHub Copilot is installed and signed in."
+        );
+      }
+    }
+    const model = models[0];
+
+    const messages = [
+      vscode.LanguageModelChatMessage.User(AGENT_SYSTEM_PROMPT),
+      vscode.LanguageModelChatMessage.User(
+        `Workspace root: ${this.workspaceRoot}\n\nUser request: ${prompt}`
+      ),
+    ];
+
+    this.log.appendLine(`[agent] Sending to ${model.id}...`);
+
+    const response = await model.sendRequest(messages, {
+      modelOptions: { maxTokens },
+    } as vscode.LanguageModelChatRequestOptions);
+
+    let fullText = "";
+    for await (const chunk of response.text) {
+      fullText += chunk;
+    }
+
+    this.log.appendLine(`[agent] Response: ${fullText.length} chars`);
+    return fullText;
+  }
+
+  // ── Response Parsing ────────────────────────────────────────
+
+  parseResponse(raw: string): { actions: AgentAction[]; summary: string } {
+    const actions: AgentAction[] = [];
+    let summary = raw;
+
+    // Parse CREATE_FILE
+    const createRe = /<<<CREATE_FILE>>>\s*\npath:\s*(.+)\n<<<CONTENT>>>\n([\s\S]*?)<<<END_ACTION>>>/g;
+    let match: RegExpExecArray | null;
+    while ((match = createRe.exec(raw)) !== null) {
+      actions.push({
+        type: "create_file",
+        path: match[1].trim(),
+        content: match[2].replace(/\n$/, ""), // trim trailing newline
+        status: "completed", // will be executed
+      });
+      summary = summary.replace(match[0], "");
+    }
+
+    // Parse READ_FILE
+    const readRe = /<<<READ_FILE>>>\s*\npath:\s*(.+)\n<<<END_ACTION>>>/g;
+    while ((match = readRe.exec(raw)) !== null) {
+      actions.push({
+        type: "read_file",
+        path: match[1].trim(),
+        status: "completed",
+      });
+      summary = summary.replace(match[0], "");
+    }
+
+    // Parse LIST_DIR
+    const listRe = /<<<LIST_DIR>>>\s*\npath:\s*(.+)\n<<<END_ACTION>>>/g;
+    while ((match = listRe.exec(raw)) !== null) {
+      actions.push({
+        type: "list_dir",
+        path: match[1].trim(),
+        status: "completed",
+      });
+      summary = summary.replace(match[0], "");
+    }
+
+    // Parse EDIT_FILE
+    const editRe =
+      /<<<EDIT_FILE>>>\s*\npath:\s*(.+)\n<<<OLD>>>\n([\s\S]*?)<<<NEW>>>\n([\s\S]*?)<<<END_ACTION>>>/g;
+    while ((match = editRe.exec(raw)) !== null) {
+      actions.push({
+        type: "edit_file",
+        path: match[1].trim(),
+        oldText: match[2].replace(/\n$/, ""),
+        newText: match[3].replace(/\n$/, ""),
+        status: "completed",
+      });
+      summary = summary.replace(match[0], "");
+    }
+
+    // Parse RUN_COMMAND
+    const cmdRe = /<<<RUN_COMMAND>>>\s*\ncommand:\s*(.+)\n<<<END_ACTION>>>/g;
+    while ((match = cmdRe.exec(raw)) !== null) {
+      actions.push({
+        type: "run_command",
+        command: match[1].trim(),
+        status: "completed",
+      });
+      summary = summary.replace(match[0], "");
+    }
+
+    // Clean up summary
+    summary = summary.replace(/\n{3,}/g, "\n\n").trim();
+
+    // Sort actions by their position in the original text to maintain order
+    actions.sort((a, b) => {
+      const aPos = this.findActionPosition(raw, a);
+      const bPos = this.findActionPosition(raw, b);
+      return aPos - bPos;
+    });
+
+    // ── FALLBACK: If Copilot returned markdown code blocks but no action blocks,
+    //    extract code and create files automatically ──
+    if (actions.length === 0) {
+      const fallbackActions = this.extractFallbackFiles(raw);
+      if (fallbackActions.length > 0) {
+        this.log.appendLine(`[agent] No action blocks found — using fallback extraction (${fallbackActions.length} files)`);
+        return { actions: fallbackActions, summary };
+      }
+    }
+
+    return { actions, summary };
+  }
+
+  /**
+   * Fallback: extract file contents from markdown code blocks when Copilot
+   * doesn't use the structured action format.
+   */
+  private extractFallbackFiles(raw: string): AgentAction[] {
+    const actions: AgentAction[] = [];
+
+    // Match markdown code blocks: ```lang\n...code...\n```
+    const codeBlockRe = /```(\w+)?\n([\s\S]*?)```/g;
+    let match: RegExpExecArray | null;
+    const blocks: Array<{lang: string; code: string}> = [];
+    while ((match = codeBlockRe.exec(raw)) !== null) {
+      const lang = (match[1] || "").toLowerCase();
+      const code = match[2].trim();
+      if (code.length > 5) { // skip trivially short blocks (like output examples)
+        blocks.push({ lang, code });
+      }
+    }
+
+    if (blocks.length === 0) return [];
+
+    // Try to extract filenames from the text before each code block
+    for (const block of blocks) {
+      const filename = this.inferFilename(raw, block.lang, block.code);
+      if (filename) {
+        actions.push({
+          type: "create_file",
+          path: filename,
+          content: block.code,
+          status: "completed",
+        });
+      }
+    }
+
+    // If we couldn't infer filenames, use the first substantial code block with a default name
+    if (actions.length === 0 && blocks.length > 0) {
+      const mainBlock = blocks[0];
+      const ext = this.langToExtension(mainBlock.lang);
+      const defaultName = `main${ext}`;
+      actions.push({
+        type: "create_file",
+        path: defaultName,
+        content: mainBlock.code,
+        status: "completed",
+      });
+    }
+
+    return actions;
+  }
+
+  /**
+   * Try to infer a filename from surrounding text or code content.
+   */
+  private inferFilename(raw: string, lang: string, code: string): string | null {
+    // Look for explicit filename mentions in the text near the code block
+    // Patterns like: "file.py", `file.py`, Create file.py, save as file.py
+    const ext = this.langToExtension(lang);
+    const escapedCode = code.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').slice(0, 50);
+    
+    // Find the position of this code block
+    const codeIdx = raw.indexOf(code.slice(0, 40));
+    const textBefore = codeIdx > 0 ? raw.slice(Math.max(0, codeIdx - 300), codeIdx) : raw;
+
+    // Look for file paths/names in text before the code block
+    const filePatterns = [
+      /[`"']([\w.\-\/]+\.[a-z]{1,5})[`"']/gi,
+      /(?:file|named?|called|save\s+(?:as|to)|create)\s+[`"']?([\w.\-\/]+\.[a-z]{1,5})[`"']?/gi,
+      /([\w\-]+\.[a-z]{1,5})\s*:/gi,
+    ];
+
+    for (const pattern of filePatterns) {
+      pattern.lastIndex = 0;
+      const m = pattern.exec(textBefore);
+      if (m) {
+        const name = m[1];
+        // Validate it looks like a real filename
+        if (name.includes('.') && !name.startsWith('.') && name.length < 100) {
+          return name;
+        }
+      }
+    }
+
+    // Try to infer from code content
+    // Python: if __name__ == '__main__' or specific imports
+    if (lang === 'python' || lang === 'py') {
+      const mainMatch = code.match(/def\s+(\w+)\s*\(/);
+      if (mainMatch && mainMatch[1] !== 'main') {
+        return `${mainMatch[1]}${ext}`;
+      }
+    }
+
+    // HTML files
+    if (lang === 'html' && code.includes('<html')) {
+      return 'index.html';
+    }
+
+    // JavaScript/TypeScript with exports
+    if ((lang === 'javascript' || lang === 'js' || lang === 'typescript' || lang === 'ts')) {
+      const exportMatch = code.match(/(?:class|function)\s+(\w+)/);
+      if (exportMatch) {
+        return `${exportMatch[1].toLowerCase()}${ext}`;
+      }
+    }
+
+    return null;
+  }
+
+  private langToExtension(lang: string): string {
+    const map: Record<string, string> = {
+      python: '.py', py: '.py',
+      javascript: '.js', js: '.js',
+      typescript: '.ts', ts: '.ts',
+      java: '.java',
+      c: '.c', cpp: '.cpp', 'c++': '.cpp',
+      csharp: '.cs', 'c#': '.cs',
+      go: '.go', golang: '.go',
+      rust: '.rs',
+      ruby: '.rb',
+      php: '.php',
+      swift: '.swift',
+      kotlin: '.kt',
+      html: '.html',
+      css: '.css',
+      sql: '.sql',
+      shell: '.sh', bash: '.sh', sh: '.sh', zsh: '.sh',
+      r: '.r',
+      dart: '.dart',
+      lua: '.lua',
+      perl: '.pl',
+      scala: '.scala',
+      yaml: '.yaml', yml: '.yaml',
+      json: '.json',
+      xml: '.xml',
+      toml: '.toml',
+      ini: '.ini',
+      dockerfile: 'Dockerfile',
+      makefile: 'Makefile',
+      '': '.txt',
+    };
+    return map[lang] || `.${lang || 'txt'}`;
+  }
+
+  private findActionPosition(raw: string, action: AgentAction): number {
+    // Use a more specific search string for each action to handle duplicates
+    switch (action.type) {
+      case "create_file":
+        return raw.indexOf(`<<<CREATE_FILE>>>\npath: ${action.path}`);
+      case "read_file":
+        return raw.indexOf(`<<<READ_FILE>>>\npath: ${action.path}`);
+      case "list_dir":
+        return raw.indexOf(`<<<LIST_DIR>>>\npath: ${action.path}`);
+      case "edit_file":
+        return raw.indexOf(`<<<EDIT_FILE>>>\npath: ${action.path}`);
+      case "run_command":
+        return raw.indexOf(`<<<RUN_COMMAND>>>\ncommand: ${action.command}`);
+      default:
+        return 0;
+    }
+  }
+
+  // ── Action Execution ────────────────────────────────────────
+
+  private async executeAction(action: AgentAction): Promise<void> {
+    try {
+      switch (action.type) {
+        case "create_file":
+          await this.createFile(action.path!, action.content!);
+          action.output = `Created ${action.path}`;
+          action.status = "completed";
+          break;
+
+        case "read_file":
+          const content = await this.readFile(action.path!);
+          action.output = content;
+          action.content = content;
+          action.status = "completed";
+          break;
+
+        case "list_dir":
+          const items = await this.listDir(action.path!);
+          action.output = items.join("\n");
+          action.status = "completed";
+          break;
+
+        case "edit_file":
+          await this.editFile(action.path!, action.oldText!, action.newText!);
+          action.output = `Edited ${action.path}`;
+          action.status = "completed";
+          break;
+
+        default:
+          action.status = "error";
+          action.error = `Unknown action type: ${action.type}`;
+      }
+
+      this.log.appendLine(
+        `[agent] ${action.type} → ${action.status}: ${action.output?.slice(0, 100)}`
+      );
+    } catch (err: any) {
+      action.status = "error";
+      action.error = err.message;
+      this.log.appendLine(
+        `[agent] ${action.type} → ERROR: ${err.message}`
+      );
+    }
+  }
+
+  // ── File System Operations ──────────────────────────────────
+
+  private async createFile(relPath: string, content: string): Promise<void> {
+    const absPath = path.resolve(this.workspaceRoot, relPath);
+    // Ensure directory exists
+    const dir = path.dirname(absPath);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    fs.writeFileSync(absPath, content, "utf-8");
+    this.log.appendLine(`[agent] Created file: ${absPath}`);
+  }
+
+  private async readFile(relPath: string): Promise<string> {
+    const absPath = path.resolve(this.workspaceRoot, relPath);
+    return fs.readFileSync(absPath, "utf-8");
+  }
+
+  private async listDir(relPath: string): Promise<string[]> {
+    const absPath = path.resolve(this.workspaceRoot, relPath);
+    const entries = fs.readdirSync(absPath, { withFileTypes: true });
+    return entries.map((e) => (e.isDirectory() ? `${e.name}/` : e.name));
+  }
+
+  private async editFile(
+    relPath: string,
+    oldText: string,
+    newText: string
+  ): Promise<void> {
+    const absPath = path.resolve(this.workspaceRoot, relPath);
+    let content = fs.readFileSync(absPath, "utf-8");
+    if (!content.includes(oldText)) {
+      throw new Error(`Could not find text to replace in ${relPath}`);
+    }
+    content = content.replace(oldText, newText);
+    fs.writeFileSync(absPath, content, "utf-8");
+  }
+
+  // ── Terminal Command Execution ──────────────────────────────
+
+  private runShellCommand(command: string): Promise<string> {
+    return new Promise((resolve, reject) => {
+      cp.exec(
+        command,
+        {
+          cwd: this.workspaceRoot,
+          timeout: 30000, // 30s timeout
+          maxBuffer: 1024 * 1024, // 1MB
+          env: { ...process.env, FORCE_COLOR: "0" },
+        },
+        (err, stdout, stderr) => {
+          if (err && !stdout && !stderr) {
+            reject(new Error(err.message));
+            return;
+          }
+          // Return combined stdout + stderr
+          const output = [stdout, stderr].filter(Boolean).join("\n").trim();
+          resolve(output || "(no output)");
+        }
+      );
+    });
+  }
+
+  // ── Summary Building ────────────────────────────────────────
+
+  private buildActionsSummary(actions: AgentAction[]): string {
+    if (actions.length === 0) return "No actions performed.";
+
+    const lines: string[] = [];
+    for (const a of actions) {
+      switch (a.type) {
+        case "create_file":
+          lines.push(`📄 Created \`${a.path}\``);
+          break;
+        case "edit_file":
+          lines.push(`✏️ Edited \`${a.path}\``);
+          break;
+        case "read_file":
+          lines.push(`📖 Read \`${a.path}\``);
+          break;
+        case "list_dir":
+          lines.push(`📁 Listed \`${a.path}\``);
+          break;
+        case "run_command":
+          const icon =
+            a.status === "completed"
+              ? "✅"
+              : a.status === "denied"
+                ? "🚫"
+                : "❌";
+          lines.push(`${icon} \`${a.command}\` → ${a.status}`);
+          if (a.output && a.status === "completed") {
+            lines.push(`   Output: ${a.output.slice(0, 500)}`);
+          }
+          break;
+      }
+    }
+    return lines.join("\n");
+  }
+
+  // ── Chat Logging ────────────────────────────────────────────
+
+  private logToChat(task: AgentTask) {
+    if (!this.chatLog) return;
+
+    const time = new Date().toLocaleTimeString();
+    const sep = "━".repeat(60);
+
+    this.chatLog.appendLine(sep);
+    this.chatLog.appendLine(
+      `🤖 AGENT [${task.id.slice(0, 16)}]  ${time}  Status: ${task.status.toUpperCase()}`
+    );
+    this.chatLog.appendLine(sep);
+    this.chatLog.appendLine("");
+    this.chatLog.appendLine(`  🧑 USER: ${task.prompt}`);
+    this.chatLog.appendLine("");
+
+    // Log actions
+    for (const action of task.actions) {
+      const icon =
+        action.status === "completed"
+          ? "✅"
+          : action.status === "pending_approval"
+            ? "⏳"
+            : action.status === "denied"
+              ? "🚫"
+              : "❌";
+
+      if (action.type === "create_file") {
+        this.chatLog.appendLine(`  ${icon} CREATE ${action.path}`);
+      } else if (action.type === "edit_file") {
+        this.chatLog.appendLine(`  ${icon} EDIT ${action.path}`);
+      } else if (action.type === "read_file") {
+        this.chatLog.appendLine(`  ${icon} READ ${action.path}`);
+      } else if (action.type === "list_dir") {
+        this.chatLog.appendLine(`  ${icon} LIST ${action.path}`);
+      } else if (action.type === "run_command") {
+        this.chatLog.appendLine(
+          `  ${icon} RUN: ${action.command}  [${action.status}]`
+        );
+        if (action.output) {
+          this.chatLog.appendLine(`      → ${action.output.slice(0, 200)}`);
+        }
+      }
+    }
+
+    this.chatLog.appendLine("");
+    if (task.message) {
+      this.chatLog.appendLine(`  💬 ${task.message.split("\n").join("\n     ")}`);
+    }
+    this.chatLog.appendLine("");
+
+    this.chatLog.show(true);
+  }
+}

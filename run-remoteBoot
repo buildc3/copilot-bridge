@@ -1,0 +1,57 @@
+#!/bin/zsh
+# ─────────────────────────────────────────────────────────
+#  run-remoteBoot — Launch the entire Copilot Bridge system
+#
+#  Usage:  run-remoteBoot
+#          (from anywhere in your terminal)
+# ─────────────────────────────────────────────────────────
+
+BRIDGE_DIR="/Users/pikachu/Desktop/J/Create/Era/copilot-bridge"
+EXT_DIR="$BRIDGE_DIR/vscode-extension"
+BOT_DIR="$BRIDGE_DIR/connectors/telegram"
+WORKSPACE="/Users/pikachu/Desktop/J/Create"
+
+echo "🚀 Copilot Bridge — Remote Boot"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+# 0. Prevent system sleep while bridge is running
+echo "\n☕ Preventing system sleep..."
+caffeinate -dims &
+CAFFEINATE_PID=$!
+trap "kill $CAFFEINATE_PID 2>/dev/null; echo '\n😴 Sleep prevention released. Goodbye!'; exit" INT TERM EXIT
+echo "✅ System will stay awake (caffeinate PID: $CAFFEINATE_PID)"
+
+# 1. Compile the extension
+echo "\n⚙️  Compiling extension..."
+cd "$EXT_DIR" && npm run compile 2>&1
+if [ $? -ne 0 ]; then
+  echo "❌ Compile failed. Fix errors and try again."
+  exit 1
+fi
+echo "✅ Extension compiled"
+
+# 2. Launch Extension Development Host (background)
+echo "\n🖥️  Launching VS Code Extension Host..."
+code --extensionDevelopmentPath="$EXT_DIR" --folder-uri "file://$WORKSPACE" &
+sleep 3
+echo "✅ Extension Host launched (server auto-starts on port 7842)"
+
+# 3. Wait for server to be ready
+echo "\n⏳ Waiting for server..."
+for i in {1..15}; do
+  if curl -s http://127.0.0.1:7842/v1/health > /dev/null 2>&1; then
+    echo "✅ Server is up!"
+    break
+  fi
+  if [ $i -eq 15 ]; then
+    echo "⚠️  Server not responding yet — it may still be starting."
+    echo "   Run 'Copilot Bridge: Start Server' from VS Code command palette if needed."
+  fi
+  sleep 1
+done
+
+# 4. Start the Telegram bot (foreground — Ctrl+C to stop everything)
+echo "\n🤖 Starting Telegram bot..."
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "   Press Ctrl+C to stop\n"
+cd "$BOT_DIR" && npx ts-node bot.ts
