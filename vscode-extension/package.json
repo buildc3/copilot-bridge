@@ -49,6 +49,10 @@
       {
         "command": "copilotBridge.agent",
         "title": "Copilot Bridge: Run Agent Task"
+      },
+      {
+        "command": "copilotBridge.selectWorkspace",
+        "title": "Copilot Bridge: Select Workspace Folder"
       }
     ],
     "configuration": {
@@ -88,6 +92,11 @@
           "type": "string",
           "default": "",
           "description": "Workspace root path for the agent. Leave empty to use the currently open VS Code workspace folder."
+        },
+        "copilotBridge.promptForWorkspace": {
+          "type": "boolean",
+          "default": true,
+          "description": "When true, shows a folder picker on server start to choose the workspace root."
         }
       }
     }
