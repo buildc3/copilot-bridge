@@ -145,7 +145,7 @@ export class Agent {
 
   // ── Run ─────────────────────────────────────────────────────
 
-  async run(prompt: string): Promise<AgentTask> {
+  async run(prompt: string, modelOverride?: string): Promise<AgentTask> {
     const taskId = `task_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
     const task: AgentTask = {
       id: taskId,
@@ -157,7 +157,7 @@ export class Agent {
     this.tasks.set(taskId, task);
 
     try {
-      const model = await this.getModel();
+      const model = await this.getModel(modelOverride);
 
       // Build initial messages
       const messages: vscode.LanguageModelChatMessage[] = [
@@ -484,9 +484,9 @@ export class Agent {
 
   // ── Model Selection ─────────────────────────────────────────
 
-  private async getModel(): Promise<vscode.LanguageModelChat> {
+  private async getModel(override?: string): Promise<vscode.LanguageModelChat> {
     const config = vscode.workspace.getConfiguration("copilotBridge");
-    const modelId = config.get<string>("model", "copilot-gpt-4o");
+    const modelId = override ?? config.get<string>("model", "copilot-gpt-4o");
 
     let models = await vscode.lm.selectChatModels({ family: modelId });
     if (models.length === 0) {

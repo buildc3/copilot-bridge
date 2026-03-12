@@ -327,12 +327,12 @@ export class BridgeServer {
     req: http.IncomingMessage,
     res: http.ServerResponse
   ) {
-    const body = await this.readBody<{ prompt: string }>(req);
+    const body = await this.readBody<{ prompt: string; model?: string }>(req);
     if (!body.prompt) {
       return this.json(res, 400, { error: 'Missing required field "prompt"' });
     }
 
-    const task = await this.agent.run(body.prompt);
+    const task = await this.agent.run(body.prompt, body.model);
 
     // Emit to sidebar webview
     emitChatMessage({

@@ -14,12 +14,31 @@ WORKSPACE="/Users/pikachu/Desktop/J/Create"
 echo "🚀 Copilot Bridge — Remote Boot"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-# 0. Prevent system sleep while bridge is running
-echo "\n☕ Preventing system sleep..."
+# 0. Prevent system sleep while bridge is running (including lid close)
+echo "\n☕ Preventing system sleep (including lid-close)..."
 caffeinate -dims &
 CAFFEINATE_PID=$!
-trap "kill $CAFFEINATE_PID 2>/dev/null; echo '\n😴 Sleep prevention released. Goodbye!'; exit" INT TERM EXIT
-echo "✅ System will stay awake (caffeinate PID: $CAFFEINATE_PID)"
+
+# Prevent sleep when lid is closed (requires sudo — will prompt once)
+sudo pmset -b disablesleep 1 2>/dev/null
+LID_SLEEP_DISABLED=$?
+if [ $LID_SLEEP_DISABLED -eq 0 ]; then
+  echo "✅ Lid-close sleep disabled (pmset disablesleep 1)"
+else
+  echo "⚠️  Could not disable lid-close sleep (needs sudo). System may sleep on lid close."
+fi
+
+cleanup() {
+  kill $CAFFEINATE_PID 2>/dev/null
+  if [ $LID_SLEEP_DISABLED -eq 0 ]; then
+    sudo pmset -b disablesleep 0 2>/dev/null
+    echo "\n😴 Lid-close sleep re-enabled."
+  fi
+  echo "😴 Sleep prevention released. Goodbye!"
+  exit
+}
+trap cleanup INT TERM EXIT
+echo "✅ System will stay awake even with lid closed (caffeinate PID: $CAFFEINATE_PID)"
 
 # 1. Compile the extension
 echo "\n⚙️  Compiling extension..."

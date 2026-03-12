@@ -10,8 +10,10 @@
  *   /new     — Reset conversation
  *   /chat    — Switch to simple chat mode (no file/command actions)
  *   /agent   — Switch to agent mode (default — can create files, run commands)
+ *   /model   — Change the AI model via inline keyboard
  *   /models  — List available AI models
  *   /status  — Check VS Code connection
+ *   /stop    — Gracefully shut down the entire bridge
  *   /help    — Show help
  */
 
@@ -87,7 +89,8 @@ async function bridgeFetch(
 
 // Agent API
 async function agentRun(
-  prompt: string
+  prompt: string,
+  model?: string
 ): Promise<{
   taskId: string;
   status: string;
@@ -95,7 +98,9 @@ async function agentRun(
   pendingCommand: string | null;
   actions: any[];
 }> {
-  return bridgeFetch("/v1/agent", "POST", { prompt });
+  const body: any = { prompt };
+  if (model) body.model = model;
+  return bridgeFetch("/v1/agent", "POST", body);
 }
 
 async function agentApprove(
@@ -119,18 +124,21 @@ async function createConversation(): Promise<string> {
 
 async function sendChatMessage(
   conversationId: string,
-  prompt: string
+  prompt: string,
+  model?: string
 ): Promise<string> {
+  const body: any = { prompt };
+  if (model) body.model = model;
   const data = await bridgeFetch(
     `/v1/conversations/${conversationId}/message`,
     "POST",
-    { prompt }
+    body
   );
   return data.response;
 }
 
 async function getModels(): Promise<
-  Array<{ id: string; family: string; vendor: string }>
+  Array<{ id: string; family: string; vendor: string; credits: number }>
 > {
   const data = await bridgeFetch("/v1/models");
   return data.models;
@@ -152,6 +160,7 @@ type BotMode = "agent" | "chat";
 interface ChatState {
   mode: BotMode;
   conversationId?: string;
+  model?: string;
 }
 
 const chatStates = new Map<number, ChatState>();
@@ -206,8 +215,10 @@ I'm connected to GitHub Copilot running in VS Code.
 /agent — Switch to agent mode
 /chat — Switch to chat mode
 /new — Start fresh
+/model — Change AI model
 /models — List AI models
 /status — Check connection
+/stop — Shut down the bridge
 
 Current mode: *${state.mode.toUpperCase()}*`,
     { parse_mode: "Markdown" }
@@ -225,8 +236,10 @@ bot.onText(/\/help/, async (msg) => {
 🤖 /agent — Agent mode (creates files, runs commands)
 💬 /chat — Simple chat mode
 🔄 /new — Reset conversation
+🧠 /model — Change AI model
 📋 /models — List available models
 🔌 /status — Check VS Code connection
+🛑 /stop — Shut down the bridge
 
 Current mode: *${state.mode.toUpperCase()}*
 
@@ -273,12 +286,41 @@ bot.onText(/\/models/, async (msg) => {
   if (!isAllowed(msg.from?.id)) return;
   try {
     const models = await getModels();
-    const list = models.map((m) => `• *${m.family}* (${m.vendor})`).join("\n");
-    bot.sendMessage(msg.chat.id, `*Available Models:*\n${list || "None found"}`, {
+    const state = getState(msg.chat.id);
+    const list = models.map((m) => `• *${m.family}* (${m.vendor}) — ${formatCredits(m.credits)}`).join("\n");
+    bot.sendMessage(msg.chat.id, `*Available Models:*\n${list || "None found"}\n\nCurrent: *${state.model ?? "default (copilot-gpt-4o)"}*\n\nUse /model to change.`, {
       parse_mode: "Markdown",
     });
   } catch (err: any) {
     bot.sendMessage(msg.chat.id, `❌ Failed: ${err.message}\n\nIs VS Code running?`);
+  }
+});
+
+bot.onText(/\/model/, async (msg) => {
+  if (!isAllowed(msg.from?.id)) return;
+  // Don't trigger on /models
+  if (msg.text && /^\/models/.test(msg.text)) return;
+  try {
+    const models = await getModels();
+    if (models.length === 0) {
+      bot.sendMessage(msg.chat.id, "❌ No models available. Is VS Code running?");
+      return;
+    }
+    const state = getState(msg.chat.id);
+    const keyboard = models.map((m) => [
+      {
+        text: `${(state.model ?? "copilot-gpt-4o") === m.family ? "✅ " : ""}${m.family} — ${formatCredits(m.credits)}`,
+        callback_data: `model:${m.family}`,
+      },
+    ]);
+    // Add a "reset to default" option
+    keyboard.push([{ text: "🔄 Reset to default", callback_data: "model:__default" }]);
+    bot.sendMessage(msg.chat.id, `*Select a model:*\n\nCurrent: *${state.model ?? "default (copilot-gpt-4o)"}*`, {
+      parse_mode: "Markdown",
+      reply_markup: { inline_keyboard: keyboard },
+    });
+  } catch (err: any) {
+    bot.sendMessage(msg.chat.id, `❌ Failed: ${err.message}`);
   }
 });
 
@@ -300,6 +342,18 @@ bot.onText(/\/status/, async (msg) => {
   }
 });
 
+bot.onText(/\/stop/, async (msg) => {
+  if (!isAllowed(msg.from?.id)) return;
+  await bot.sendMessage(
+    msg.chat.id,
+    "🛑 *Shutting down Copilot Bridge...*\n\nBot is stopping. Sleep prevention will be released.",
+    { parse_mode: "Markdown" }
+  );
+  bot.stopPolling();
+  console.log("\n🛑 Shutdown requested via /stop command.");
+  process.exit(0);
+});
+
 // ── Message Handler ───────────────────────────────────────────────
 
 bot.on("message", async (msg) => {
@@ -317,7 +371,7 @@ bot.on("message", async (msg) => {
 
   try {
     if (state.mode === "agent") {
-      await handleAgentMessage(chatId, msg.text, typingInterval);
+      await handleAgentMessage(chatId, msg.text, typingInterval, state.model);
     } else {
       await handleChatMessage(chatId, msg.text, state, typingInterval);
     }
@@ -339,9 +393,10 @@ bot.on("message", async (msg) => {
 async function handleAgentMessage(
   chatId: number,
   prompt: string,
-  typingInterval: ReturnType<typeof setInterval>
+  typingInterval: ReturnType<typeof setInterval>,
+  model?: string
 ) {
-  const result = await agentRun(prompt);
+  const result = await agentRun(prompt, model);
   clearInterval(typingInterval);
 
   // Build response with action summary
@@ -387,7 +442,7 @@ async function handleChatMessage(
     state.conversationId = await createConversation();
   }
 
-  const response = await sendChatMessage(state.conversationId, text);
+  const response = await sendChatMessage(state.conversationId, text, state.model);
   clearInterval(typingInterval);
 
   await safeSend(chatId, response, { parse_mode: "Markdown" });
@@ -400,6 +455,31 @@ bot.on("callback_query", async (query) => {
 
   const chatId = query.message.chat.id;
   const messageId = query.message.message_id;
+
+  // ── Model selection callback ──
+  if (query.data.startsWith("model:")) {
+    const chosen = query.data.slice("model:".length);
+    const state = getState(chatId);
+    if (chosen === "__default") {
+      state.model = undefined;
+      bot.answerCallbackQuery(query.id, { text: "Reset to default model" });
+      bot.editMessageText("✅ Model reset to *default (copilot-gpt-4o)*", {
+        chat_id: chatId,
+        message_id: messageId,
+        parse_mode: "Markdown",
+      });
+    } else {
+      state.model = chosen;
+      bot.answerCallbackQuery(query.id, { text: `Model: ${chosen}` });
+      bot.editMessageText(`✅ Model set to *${chosen}*`, {
+        chat_id: chatId,
+        message_id: messageId,
+        parse_mode: "Markdown",
+      });
+    }
+    return;
+  }
+
   const [action, taskId] = query.data.split(":");
 
   if (!taskId || (action !== "approve" && action !== "deny")) {
@@ -470,6 +550,13 @@ bot.on("callback_query", async (query) => {
 });
 
 // ── Helpers ───────────────────────────────────────────────────────
+
+function formatCredits(credits: number): string {
+  if (credits === 0) return "⚡ free";
+  if (credits < 1) return `${credits}x ⚡`;
+  if (credits === 1) return "1x";
+  return `${credits}x 🔥`;
+}
 
 function formatActions(
   actions: Array<{ type: string; path?: string; command?: string; status: string }>

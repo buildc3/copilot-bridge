@@ -140,10 +140,60 @@ async function runWithModel(
 }
 
 /**
+ * Known credit multipliers for GitHub Copilot models.
+ * Based on GitHub Copilot pricing (premium requests).
+ * Models not listed here default to 1x.
+ */
+const CREDIT_MULTIPLIERS: Record<string, number> = {
+  // GPT-4o family
+  "gpt-4o":           1,
+  "copilot-gpt-4o":   1,
+  "gpt-4o-mini":      0.25,
+  "copilot-gpt-4o-mini": 0.25,
+
+  // GPT-4.1 family
+  "gpt-4.1":          1,
+  "gpt-4.1-mini":     0.25,
+  "gpt-4.1-nano":     0,
+
+  // o-series (reasoning)
+  "o1":               3,
+  "o1-mini":          1,
+  "o1-preview":       3,
+  "o3":               3,
+  "o3-mini":          1,
+  "o4-mini":          1,
+
+  // Claude
+  "claude-3.5-sonnet":  1,
+  "claude-sonnet-4":    1,
+  "claude-3.7-sonnet":  1,
+  "claude-sonnet":      1,
+  "claude-opus-4":      3,
+
+  // Gemini
+  "gemini-2.0-flash":   0.25,
+  "gemini-2.5-pro":     1,
+  "gemini-exp":         1,
+};
+
+function getCreditMultiplier(family: string): number {
+  // Exact match first
+  if (family in CREDIT_MULTIPLIERS) return CREDIT_MULTIPLIERS[family];
+  // Lowercase match
+  const lower = family.toLowerCase();
+  for (const [key, val] of Object.entries(CREDIT_MULTIPLIERS)) {
+    if (lower === key.toLowerCase()) return val;
+    if (lower.includes(key.toLowerCase())) return val;
+  }
+  return 1; // default
+}
+
+/**
  * List available language models.
  */
 export async function listModels(): Promise<
-  Array<{ id: string; family: string; vendor: string; version: string }>
+  Array<{ id: string; family: string; vendor: string; version: string; credits: number }>
 > {
   const models = await vscode.lm.selectChatModels();
   return models.map((m) => ({
@@ -151,5 +201,6 @@ export async function listModels(): Promise<
     family: m.family,
     vendor: m.vendor,
     version: m.version,
+    credits: getCreditMultiplier(m.family),
   }));
 }

@@ -11,43 +11,6 @@ import { BridgeServer } from "./server";
 import { ChatViewProvider } from "./chat-view";
 
 let server: BridgeServer | undefined;
-let currentWorkspaceRoot: string | undefined;
-
-/**
- * Show a folder picker and return the selected path, or undefined if cancelled.
- */
-async function pickWorkspaceFolder(): Promise<string | undefined> {
-  const result = await vscode.window.showOpenDialog({
-    canSelectFolders: true,
-    canSelectFiles: false,
-    canSelectMany: false,
-    openLabel: "Select Workspace Folder",
-    title: "Copilot Bridge — Choose workspace root for the agent",
-  });
-  return result?.[0]?.fsPath;
-}
-
-/**
- * Resolve the workspace root: prompt with folder picker if configured,
- * otherwise fall back to config / VS Code workspace.
- */
-async function resolveWorkspaceRoot(): Promise<string | undefined> {
-  const config = vscode.workspace.getConfiguration("copilotBridge");
-  const promptForWs = config.get<boolean>("promptForWorkspace", true);
-  const configuredRoot = config.get<string>("workspaceRoot", "") || undefined;
-
-  if (promptForWs) {
-    const picked = await pickWorkspaceFolder();
-    if (!picked) {
-      return undefined; // user cancelled
-    }
-    currentWorkspaceRoot = picked;
-    return picked;
-  }
-
-  currentWorkspaceRoot = configuredRoot;
-  return configuredRoot;
-}
 
 export function activate(context: vscode.ExtensionContext) {
   const outputChannel = vscode.window.createOutputChannel("Copilot Bridge");
@@ -64,16 +27,16 @@ export function activate(context: vscode.ExtensionContext) {
         return;
       }
 
-      const wsRoot = await resolveWorkspaceRoot();
-      if (wsRoot === undefined && vscode.workspace.getConfiguration("copilotBridge").get<boolean>("promptForWorkspace", true)) {
-        vscode.window.showWarningMessage("Copilot Bridge: No workspace folder selected — server start cancelled.");
-        return;
-      }
-
       const config = vscode.workspace.getConfiguration("copilotBridge");
       const port = config.get<number>("port", 7842);
       const host = config.get<string>("host", "127.0.0.1");
       const apiKey = config.get<string>("apiKey", "");
+
+      const wsRoot = await pickWorkspaceRoot();
+      if (!wsRoot) {
+        vscode.window.showWarningMessage("Copilot Bridge: No folder selected — server not started.");
+        return;
+      }
       server = new BridgeServer(port, host, apiKey, outputChannel, chatLog, wsRoot);
 
       try {
@@ -136,46 +99,20 @@ export function activate(context: vscode.ExtensionContext) {
     chatViewProvider
   );
 
-  // ── Select Workspace Folder ────────────────────────────────────
-  const selectWsCmd = vscode.commands.registerCommand(
-    "copilotBridge.selectWorkspace",
-    async () => {
-      const picked = await pickWorkspaceFolder();
-      if (picked) {
-        currentWorkspaceRoot = picked;
-        vscode.window.showInformationMessage(`Copilot Bridge workspace set to: ${picked}`);
-        outputChannel.appendLine(`[${ts()}] Workspace root changed to: ${picked}`);
-
-        // If server is running, restart it with the new workspace
-        if (server?.isRunning) {
-          const config = vscode.workspace.getConfiguration("copilotBridge");
-          const port = config.get<number>("port", 7842);
-          const host = config.get<string>("host", "127.0.0.1");
-          const apiKey = config.get<string>("apiKey", "");
-          await server.stop();
-          server = new BridgeServer(port, host, apiKey, outputChannel, chatLog, picked);
-          await server.start();
-          vscode.window.showInformationMessage(`✅ Copilot Bridge restarted with new workspace → http://${host}:${port}`);
-        }
-      }
-    }
-  );
-
-  context.subscriptions.push(startCmd, stopCmd, statusCmd, showChatCmd, selectWsCmd, chatViewDisposable, outputChannel, chatLog);
+  context.subscriptions.push(startCmd, stopCmd, statusCmd, showChatCmd, chatViewDisposable, outputChannel, chatLog);
 
   // Auto-start the server on activation
   outputChannel.appendLine(`[${ts()}] Copilot Bridge extension activated`);
   (async () => {
-    const wsRoot = await resolveWorkspaceRoot();
-    if (wsRoot === undefined && vscode.workspace.getConfiguration("copilotBridge").get<boolean>("promptForWorkspace", true)) {
-      outputChannel.appendLine(`[${ts()}] Auto-start skipped — no workspace folder selected`);
-      return;
-    }
-
     const config = vscode.workspace.getConfiguration("copilotBridge");
     const port = config.get<number>("port", 7842);
     const host = config.get<string>("host", "127.0.0.1");
     const apiKey = config.get<string>("apiKey", "");
+    const wsRoot = await pickWorkspaceRoot();
+    if (!wsRoot) {
+      outputChannel.appendLine(`[${ts()}] No folder selected — skipping auto-start`);
+      return;
+    }
     server = new BridgeServer(port, host, apiKey, outputChannel, chatLog, wsRoot);
     server.start().then(() => {
       outputChannel.appendLine(`[${ts()}] Server auto-started on http://${host}:${port}`);
@@ -188,6 +125,33 @@ export function activate(context: vscode.ExtensionContext) {
 
 export function deactivate() {
   server?.stop();
+}
+
+async function pickWorkspaceRoot(): Promise<string | undefined> {
+  const folders = vscode.workspace.workspaceFolders?.map(f => f.uri.fsPath) ?? [];
+
+  // If there's exactly one workspace folder, offer it as a quick option alongside "Browse…"
+  const items: vscode.QuickPickItem[] = folders.map(f => ({ label: f }));
+  items.push({ label: "$(folder) Browse…", description: "Choose a folder from disk" });
+
+  const pick = await vscode.window.showQuickPick(items, {
+    placeHolder: "Which folder should Copilot Bridge work in?",
+    title: "Copilot Bridge — Select Workspace Folder",
+  });
+
+  if (!pick) { return undefined; }
+
+  if (pick.label === "$(folder) Browse…") {
+    const uris = await vscode.window.showOpenDialog({
+      canSelectFiles: false,
+      canSelectFolders: true,
+      canSelectMany: false,
+      openLabel: "Select Workspace Folder",
+    });
+    return uris?.[0]?.fsPath;
+  }
+
+  return pick.label;
 }
 
 function ts(): string {
